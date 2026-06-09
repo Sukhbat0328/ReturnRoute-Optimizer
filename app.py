@@ -79,6 +79,72 @@ GREEN = "#1F9D55"
 ORANGE = "#F08C00"
 RED = "#D64545"
 LIGHT_BG = "#F7F9FC"
+EMPTY_SCHEDULE_COLUMNS = [
+    "planning_day",
+    "truck_id",
+    "stop_id",
+    "stop_type",
+    "customer_name",
+    "arrival_time",
+    "departure_time",
+    "on_time",
+    "route_sequence",
+]
+EMPTY_UNASSIGNED_COLUMNS = ["planning_day", "stop_id", "customer_name", "reason"]
+EMPTY_DEFERRED_COLUMNS = [
+    "planning_day",
+    "return_id",
+    "customer_name",
+    "priority_level",
+    "days_waiting",
+    "return_value_usd",
+    "weight_lbs",
+    "nearest_route_distance_miles",
+    "reason_deferred",
+]
+EMPTY_ROUTE_COLUMNS = [
+    "planning_day",
+    "truck_id",
+    "truck_status",
+    "route_sequence",
+    "delivery_stops",
+    "return_stops",
+    "route_miles",
+    "route_hours",
+    "delivery_weight_lbs",
+    "return_weight_lbs",
+    "available_return_capacity_lbs",
+    "return_capacity_utilization_%",
+    "on_time_deliveries",
+    "late_deliveries",
+    "feasible",
+    "feasibility_notes",
+    "transport_cost",
+    "co2_kg",
+]
+
+
+def empty_schedule_df():
+    return pd.DataFrame(columns=EMPTY_SCHEDULE_COLUMNS)
+
+
+def empty_unassigned_df():
+    return pd.DataFrame(columns=EMPTY_UNASSIGNED_COLUMNS)
+
+
+def empty_deferred_df():
+    return pd.DataFrame(columns=EMPTY_DEFERRED_COLUMNS)
+
+
+def empty_route_df():
+    return pd.DataFrame(columns=EMPTY_ROUTE_COLUMNS)
+
+
+def normalize_text_value(value, default=""):
+    if pd.isna(value):
+        return default
+    text = str(value).strip()
+    return text.title() if text else default
 
 
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -327,7 +393,9 @@ def validate_data(data):
     ]:
         trucks[col] = normalize_numeric(trucks[col])
     trucks["start_time"] = trucks["start_time"].apply(ensure_time)
-    trucks["truck_status"] = trucks["truck_status"].fillna("Available").astype(str)
+    trucks["truck_status"] = trucks["truck_status"].apply(
+        lambda value: normalize_text_value(value, "Available")
+    )
     trucks["maintenance_reason"] = trucks["maintenance_reason"].fillna("")
 
     for col in [
@@ -343,8 +411,12 @@ def validate_data(data):
     ]:
         stops[col] = normalize_numeric(stops[col])
 
-    stops["stop_type"] = stops["stop_type"].fillna("").astype(str).str.title()
-    stops["priority_level"] = stops["priority_level"].fillna("Medium").astype(str).str.title()
+    stops["stop_type"] = stops["stop_type"].apply(
+        lambda value: normalize_text_value(value, "")
+    )
+    stops["priority_level"] = stops["priority_level"].apply(
+        lambda value: normalize_text_value(value, "Medium")
+    )
     stops["ready_time"] = stops["ready_time"].apply(ensure_time)
     stops["due_time"] = stops["due_time"].apply(ensure_time)
 
@@ -651,17 +723,47 @@ def optimize_routes(warehouse_row, trucks_df, stops_df, controls):
     for planning_day in planning_days:
         day_trucks = trucks_df[trucks_df["planning_day"] == planning_day].copy()
         day_stops = stops_df[stops_df["planning_day"] == planning_day].copy()
+        day_trucks["truck_status"] = day_trucks["truck_status"].apply(
+            lambda value: normalize_text_value(value, "Available")
+        )
+        day_stops["stop_type"] = day_stops["stop_type"].apply(
+            lambda value: normalize_text_value(value, "")
+        )
+        day_stops["priority_level"] = day_stops["priority_level"].apply(
+            lambda value: normalize_text_value(value, "Medium")
+        )
         day_deliveries = day_stops[day_stops["stop_type"] == "Delivery"].copy()
         day_returns = day_stops[day_stops["stop_type"] == "Return"].copy()
         day_returns = calculate_priority_scores(day_returns, warehouse_row, controls)
         all_priority_scores.append(day_returns.copy())
 
-        available_trucks = day_trucks[
-            day_trucks["truck_status"].astype(str).str.lower() == "available"
-        ].copy()
-        unavailable_trucks = day_trucks[
-            day_trucks["truck_status"].astype(str).str.lower() != "available"
-        ].copy()
+        available_trucks = day_trucks[day_trucks["truck_status"] == "Available"].copy()
+        unavailable_trucks = day_trucks[day_trucks["truck_status"] != "Available"].copy()
+
+        if available_trucks.empty:
+            for _, delivery in day_deliveries.iterrows():
+                unassigned_delivery_rows.append(
+                    {
+                        "planning_day": planning_day,
+                        "stop_id": delivery["stop_id"],
+                        "customer_name": delivery["customer_name"],
+                        "reason": "No available trucks for this planning day.",
+                    }
+                )
+            for _, return_stop in day_returns.iterrows():
+                deferred_rows.append(
+                    {
+                        "planning_day": planning_day,
+                        "return_id": return_stop["stop_id"],
+                        "customer_name": return_stop["customer_name"],
+                        "priority_level": return_stop["priority_level"],
+                        "days_waiting": return_stop["days_waiting"],
+                        "return_value_usd": return_stop["return_value_usd"],
+                        "weight_lbs": return_stop["weight_lbs"],
+                        "nearest_route_distance_miles": None,
+                        "reason_deferred": "Truck unavailable due to maintenance",
+                    }
+                )
 
         route_states = {}
         for _, truck in available_trucks.iterrows():
@@ -963,12 +1065,41 @@ def optimize_routes(warehouse_row, trucks_df, stops_df, controls):
         if all_priority_scores
         else pd.DataFrame(columns=["planning_day", "stop_id", "priority_score"])
     )
+    truck_routes_df = pd.DataFrame(route_rows)
+    if truck_routes_df.empty:
+        truck_routes_df = empty_route_df()
+
+    deferred_df = pd.DataFrame(deferred_rows)
+    if deferred_df.empty:
+        deferred_df = empty_deferred_df()
+
+    stop_schedule_df = pd.DataFrame(schedule_rows)
+    if stop_schedule_df.empty:
+        stop_schedule_df = empty_schedule_df()
+    else:
+        route_lookup = {}
+        if not truck_routes_df.empty and {"truck_id", "route_sequence"}.issubset(truck_routes_df.columns):
+            route_lookup = (
+                truck_routes_df[["truck_id", "route_sequence"]]
+                .drop_duplicates(subset=["truck_id"], keep="last")
+                .set_index("truck_id")["route_sequence"]
+                .to_dict()
+            )
+        stop_schedule_df["route_sequence"] = stop_schedule_df["truck_id"].map(route_lookup)
+        for column in EMPTY_SCHEDULE_COLUMNS:
+            if column not in stop_schedule_df.columns:
+                stop_schedule_df[column] = None
+
+    unassigned_df = pd.DataFrame(unassigned_delivery_rows)
+    if unassigned_df.empty:
+        unassigned_df = empty_unassigned_df()
+
     return {
-        "truck_routes": pd.DataFrame(route_rows),
-        "deferred_returns": pd.DataFrame(deferred_rows),
-        "stop_schedule": pd.DataFrame(schedule_rows),
+        "truck_routes": truck_routes_df,
+        "deferred_returns": deferred_df,
+        "stop_schedule": stop_schedule_df,
         "priority_scores": priority_scores_df,
-        "unassigned_deliveries": pd.DataFrame(unassigned_delivery_rows),
+        "unassigned_deliveries": unassigned_df,
     }
 
 
@@ -978,11 +1109,66 @@ def calculate_kpis(warehouse_row, scenario_stops, optimization_results):
     unassigned = optimization_results["unassigned_deliveries"].copy()
     deferred = optimization_results["deferred_returns"].copy()
 
+    scenario_stops = scenario_stops.copy()
+    if "stop_type" in scenario_stops.columns:
+        scenario_stops["stop_type"] = scenario_stops["stop_type"].apply(
+            lambda value: normalize_text_value(value, "")
+        )
+    if "priority_level" in scenario_stops.columns:
+        scenario_stops["priority_level"] = scenario_stops["priority_level"].apply(
+            lambda value: normalize_text_value(value, "Medium")
+        )
+
     total_deliveries = int((scenario_stops["stop_type"] == "Delivery").sum())
-    completed_deliveries = int(len(schedule[schedule["stop_type"] == "Delivery"]))
+    total_returns = int((scenario_stops["stop_type"] == "Return").sum())
     total_high_priority_returns = int(
         ((scenario_stops["stop_type"] == "Return") & (scenario_stops["priority_level"] == "High")).sum()
     )
+
+    if routes.empty:
+        routes = empty_route_df()
+
+    schedule_has_stop_type = not schedule.empty and "stop_type" in schedule.columns
+    if not schedule_has_stop_type:
+        optimized_total_cost = 0.0
+        optimized_total_miles = 0.0
+        baseline_cost = warehouse_row["manual_baseline_total_cost"]
+        baseline_miles = warehouse_row["manual_baseline_total_miles"]
+        baseline_note = ""
+        if pd.isna(baseline_cost) or baseline_cost <= 0:
+            baseline_cost = 0.0
+            baseline_note = "Manual baseline cost missing; defaulted to 0 because no feasible schedule was created."
+        if pd.isna(baseline_miles) or baseline_miles <= 0:
+            baseline_miles = 0.0
+            baseline_note = (
+                baseline_note + " " if baseline_note else ""
+            ) + "Manual baseline miles missing; defaulted to 0 because no feasible schedule was created."
+        return {
+            "delivery_completion_rate": 0,
+            "on_time_delivery_rate": 0,
+            "high_priority_return_pickup_rate": 0,
+            "deferred_return_count": total_returns,
+            "total_transportation_cost": 0,
+            "cost_savings_vs_manual": round(float(baseline_cost), 2),
+            "total_miles_traveled": 0,
+            "return_capacity_utilization": 0,
+            "baseline_total_cost": round(float(baseline_cost), 2),
+            "baseline_total_miles": round(float(baseline_miles), 2),
+            "manual_high_priority_returns": math.floor(
+                min(total_high_priority_returns, total_high_priority_returns * 0.6)
+            ),
+            "manual_return_capacity_utilization": 45.0,
+            "unassigned_delivery_count": int(len(unassigned)),
+            "baseline_note": baseline_note,
+            "high_priority_return_count": total_high_priority_returns,
+            "picked_high_priority_returns": 0,
+            "completed_deliveries": 0,
+            "total_deliveries": total_deliveries,
+            "on_time_deliveries": 0,
+            "total_returns": total_returns,
+        }
+
+    completed_deliveries = int(len(schedule[schedule["stop_type"] == "Delivery"]))
     picked_high_priority_returns = int(
         len(
             schedule[
@@ -993,7 +1179,6 @@ def calculate_kpis(warehouse_row, scenario_stops, optimization_results):
     on_time_deliveries = int(
         len(schedule[(schedule["stop_type"] == "Delivery") & (schedule["on_time"] == True)])
     )
-    total_returns = int((scenario_stops["stop_type"] == "Return").sum())
     total_return_weight_picked = float(schedule[schedule["stop_type"] == "Return"]["weight_lbs"].sum())
 
     used_routes = routes[routes["delivery_stops"] + routes["return_stops"] > 0]
@@ -1309,6 +1494,15 @@ def main():
     scenario_stops = data["Delivery_Return_Inputs"][
         data["Delivery_Return_Inputs"]["scenario_id"].astype(str) == str(scenario_id)
     ].copy()
+    scenario_trucks["truck_status"] = scenario_trucks["truck_status"].apply(
+        lambda value: normalize_text_value(value, "Available")
+    )
+    scenario_stops["stop_type"] = scenario_stops["stop_type"].apply(
+        lambda value: normalize_text_value(value, "")
+    )
+    scenario_stops["priority_level"] = scenario_stops["priority_level"].apply(
+        lambda value: normalize_text_value(value, "Medium")
+    )
 
     if scenario_warehouse.empty:
         st.error("The selected scenario_id does not exist in Warehouse_Inputs.")
@@ -1330,6 +1524,23 @@ def main():
     if kpis["delivery_completion_rate"] < 1:
         st.warning(
             f"Only {kpis['completed_deliveries']} of {kpis['total_deliveries']} deliveries were assigned. Review truck capacity, shift limits, or maintenance availability."
+        )
+    no_truck_days = sorted(
+        scenario_trucks.groupby("planning_day")["truck_status"]
+        .apply(lambda statuses: not (statuses == "Available").any())
+        .loc[lambda item: item]
+        .index.tolist()
+    )
+    if no_truck_days:
+        st.warning(
+            f"No available trucks were found for planning day(s): {', '.join(map(str, no_truck_days))}. Deliveries for those days remain unassigned and returns are deferred."
+        )
+    if not optimization_results["unassigned_deliveries"].empty:
+        st.warning("Some mandatory deliveries could not be assigned. Review the warning table below.")
+        st.dataframe(
+            optimization_results["unassigned_deliveries"],
+            use_container_width=True,
+            hide_index=True,
         )
     if kpis["baseline_note"]:
         st.info(kpis["baseline_note"])
