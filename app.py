@@ -1298,13 +1298,43 @@ def build_comparison_chart(kpis):
 
 
 def build_capacity_chart(routes_df):
-    active_routes = routes_df.copy()
-    active_routes["label"] = active_routes["truck_id"] + " | Day " + active_routes["planning_day"].astype(str)
     fig = go.Figure()
+    if routes_df is None or getattr(routes_df, "empty", True):
+        fig.update_layout(
+            title="No route capacity data available",
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            margin=dict(l=10, r=10, t=45, b=10),
+            yaxis_title="Utilization %",
+            xaxis_title="Truck / Day",
+        )
+        return fig
+
+    active_routes = routes_df.copy()
+    required_defaults = {
+        "truck_id": "",
+        "planning_day": "",
+        "return_capacity_utilization_%": 0,
+        "truck_status": "Unavailable",
+    }
+    for column, default_value in required_defaults.items():
+        if column not in active_routes.columns:
+            active_routes[column] = default_value
+
+    active_routes["truck_id"] = active_routes["truck_id"].fillna("").astype(str)
+    active_routes["planning_day"] = active_routes["planning_day"].fillna("").astype(str)
+    active_routes["return_capacity_utilization_%"] = pd.to_numeric(
+        active_routes["return_capacity_utilization_%"], errors="coerce"
+    ).fillna(0)
+    active_routes["truck_status"] = active_routes["truck_status"].apply(
+        lambda value: normalize_text_value(value, "Unavailable")
+    )
+    active_routes["label"] = active_routes["truck_id"] + " | Day " + active_routes["planning_day"]
+
     fig.add_bar(
         x=active_routes["label"],
         y=active_routes["return_capacity_utilization_%"],
-        marker_color=np.where(active_routes["truck_status"].str.lower() == "available", GREEN, "#CBD2D9"),
+        marker_color=np.where(active_routes["truck_status"] == "Available", GREEN, "#CBD2D9"),
         text=active_routes["return_capacity_utilization_%"].round(1).astype(str) + "%",
         textposition="outside",
     )
